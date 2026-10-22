@@ -333,5 +333,5 @@ def main() -> int:
         return 1
 
 
-if __import__("sys").version_info >= (3, 8) and __name__ == "__main__":
+if __name__ == "__main__":
     raise SystemExit(main())
