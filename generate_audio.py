@@ -62,161 +62,6 @@ def configure_websocket_endpoint() -> None:
         edge_communicate.WSS_URL = override
 
 
-def split_text(text: str, max_chars: int = CHUNK_CHARS) -> list[str]:
-    """Split at natural boundaries while preserving every source character."""
-    if max_chars < 200:
-        raise ValueError("Kích thước đoạn audio phải từ 200 ký tự trở lên.")
-    chunks: list[str] = []
-    start = 0
-    preferred_breaks = ("\n", ".", "!", "?", "。", "！", "？", ";", "；", " ")
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        if end == len(text):
-            chunks.append(text[start:end])
-            break
-
-        window = text[start:end]
-        floor = int(max_chars * 0.55)
-        candidates = [
-            window.rfind(mark) + 1
-            for mark in preferred_breaks
-            if window.rfind(mark) >= floor
-        ]
-        cut = max(candidates) if candidates else len(window)
-        if cut <= 0:
-            cut = len(window)
-        chunks.append(text[start:start + cut])
-        start += cut
-    return [chunk for chunk in chunks if chunk.strip()]
-
-
-def split_failed_chunk(text: str) -> tuple[str, str]:
-    """Split a failed chunk near its middle, preferably between sentences/words."""
-    middle = len(text) // 2
-    low, high = int(len(text) * 0.30), int(len(text) * 0.70)
-    break_chars = set("\n .!?。！？；;，,")
-    candidates = [i + 1 for i in range(low, min(high, len(text))) if text[i] in break_chars]
-    if candidates:
-        cut = min(candidates, key=lambda point: abs(point - middle))
-    else:
-        cut = middle
-    cut = max(1, min(cut, len(text) - 1))
-    return text[:cut], text[cut:]
-
-
-async def stream_audio_bytes(
-    text: str,
-    voice: str,
-    edge_rate: str,
-    sink=None,
-) -> int:
-    """Stream one request; return audio byte count and optionally append bytes to sink."""
-    import edge_tts
-
-    received = 0
-    communicator = edge_tts.Communicate(text=text, voice=voice, rate=edge_rate)
-    async for message in communicator.stream():
-        if message.get("type") != "audio":
-            continue
-        data = message.get("data") or b""
-        if not data:
-            continue
-        if sink is not None:
-            sink.write(data)
-        received += len(data)
-    if received == 0:
-        raise RuntimeError("Edge-TTS kết thúc yêu cầu nhưng không trả về dữ liệu âm thanh.")
-    return received
-
-
-async def verify_voice_service(voice: str, edge_rate: str, attempts: int) -> None:
-    """Check the selected voice with a tiny phrase before processing a long story."""
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            await stream_audio_bytes("Xin chào.", voice, edge_rate)
-            print("Kiểm tra giọng đọc: thành công.", flush=True)
-            return
-        except Exception as exc:
-            last_error = exc
-            if attempt < attempts:
-                delay = (2, 5)[min(attempt - 1, 1)]
-                print(
-                    f"Kiểm tra giọng đọc lần {attempt}/{attempts} chưa thành công: {exc}. "
-                    f"Thử lại sau {delay} giây...",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                await asyncio.sleep(delay)
-
-    raise RuntimeError(
-        "Dịch vụ Edge-TTS không trả âm thanh ngay cả với câu thử rất ngắn. "
-        "Khả năng cao dịch vụ/giọng đọc hoặc kết nối mạng đang gặp vấn đề, chưa phải do truyện quá dài. "
-        "Hãy kiểm tra Internet, thử giọng còn lại hoặc thử lại sau. "
-        f"Chi tiết: {last_error}"
-    ) from last_error
-
-
-async def write_chunk_with_recovery(
-    text: str,
-    voice: str,
-    edge_rate: str,
-    sink,
-    attempts: int,
-    label: str,
-    depth: int = 0,
-) -> int:
-    """Write a chunk into the final MP3, retrying and subdividing failures if needed."""
-    start_position = sink.tell()
-    last_error: Exception | None = None
-
-    for attempt in range(1, attempts + 1):
-        sink.seek(start_position)
-        sink.truncate()
-        try:
-            byte_count = await stream_audio_bytes(text, voice, edge_rate, sink)
-            if byte_count == 0:
-                raise RuntimeError("Không nhận được dữ liệu âm thanh.")
-            return byte_count
-        except Exception as exc:
-            last_error = exc
-            sink.seek(start_position)
-            sink.truncate()
-            if attempt < attempts:
-                delay = (2, 5)[min(attempt - 1, 1)]
-                print(
-                    f"Đoạn {label}, lần thử {attempt}/{attempts} thất bại: {exc}. "
-                    f"Thử lại sau {delay} giây...",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                await asyncio.sleep(delay)
-
-    # A shorter request may work when a long utterance contains a troublesome
-    # expression or the service fails on one particular sub-request.
-    if len(text.strip()) > MIN_RECOVERY_CHARS and depth < 6:
-        left, right = split_failed_chunk(text)
-        print(
-            f"Đoạn {label} vẫn lỗi; tự tách nhỏ hơn và tiếp tục ghép vào cùng một MP3.",
-            file=sys.stderr,
-            flush=True,
-        )
-        first_bytes = await write_chunk_with_recovery(
-            left, voice, edge_rate, sink, attempts, f"{label}.a", depth + 1
-        )
-        second_bytes = await write_chunk_with_recovery(
-            right, voice, edge_rate, sink, attempts, f"{label}.b", depth + 1
-        )
-        return first_bytes + second_bytes
-
-    preview = " ".join(text.split())[:180]
-    raise RuntimeError(
-        f"Không tạo được audio cho một đoạn ngắn ({label}). "
-        f"Đoạn văn liên quan: {preview!r}. Lỗi cuối: {last_error}. "
-        "Nội dung chưa bị tự ý bỏ qua; hãy sửa đoạn này hoặc thử lại sau."
-    ) from last_error
-
-
 async def synthesize_one_audio(
     text: str,
     voice: str,
@@ -224,15 +69,22 @@ async def synthesize_one_audio(
     output_path: str | Path,
     attempts: int = 3,
 ) -> Path:
-    """Generate one MP3 by streaming small requests into a single output file."""
+    """Generate one MP3 with one whole-script Edge-TTS request per attempt.
+
+    This intentionally matches the fast path used by GitHub Actions: Edge-TTS
+    handles its protocol-level text streaming internally, while the application
+    makes just one request for the whole chapter and writes one output MP3.
+    """
     if voice not in VOICE_OPTIONS:
         raise ValueError("Giọng đọc không hợp lệ.")
     edge_rate = rate_to_edge(rate)
     if attempts < 1:
         raise ValueError("Số lần thử phải ít nhất là 1.")
+    if not text.strip():
+        raise ValueError("Nội dung cần đọc đang trống.")
 
     try:
-        import edge_tts  # noqa: F401
+        import edge_tts
     except ImportError as exc:
         raise RuntimeError(
             "Chưa cài edge-tts. Hãy chạy: python -m pip install -r requirements.txt"
@@ -242,34 +94,43 @@ async def synthesize_one_audio(
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.stem + ".partial" + destination.suffix)
-    partial.unlink(missing_ok=True)
+    last_error: Exception | None = None
 
     try:
-        # Fail early when the chosen voice or Microsoft endpoint is not responding.
-        await verify_voice_service(voice, edge_rate, attempts)
-        chunks = split_text(text)
-        total_chunks = len(chunks)
-        if not total_chunks:
-            raise ValueError("Không có nội dung đọc sau khi tách văn bản.")
-
-        total_bytes = 0
-        with partial.open("wb") as sink:
-            for index, chunk in enumerate(chunks, start=1):
-                added = await write_chunk_with_recovery(
-                    chunk, voice, edge_rate, sink, attempts, str(index)
+        for attempt in range(1, attempts + 1):
+            partial.unlink(missing_ok=True)
+            try:
+                # Important for speed: submit the chapter as one Communicate job.
+                communicator = edge_tts.Communicate(
+                    text=text,
+                    voice=voice,
+                    rate=edge_rate,
                 )
-                total_bytes += added
+                await communicator.save(str(partial))
+                if not partial.is_file() or partial.stat().st_size == 0:
+                    raise RuntimeError("Edge-TTS không tạo được tệp MP3 hợp lệ.")
+                os.replace(partial, destination)
                 print(
-                    f"[PROGRESS] {index}/{total_chunks} đoạn đã tạo.",
+                    f"Đã tạo xong một MP3 từ toàn bộ văn bản ({len(text):,} ký tự).",
                     flush=True,
                 )
-            sink.flush()
-            os.fsync(sink.fileno())
+                return destination
+            except Exception as exc:
+                last_error = exc
+                partial.unlink(missing_ok=True)
+                if attempt < attempts:
+                    delay = (3, 8)[min(attempt - 1, 1)]
+                    print(
+                        f"Lần thử {attempt}/{attempts} thất bại: {exc}. "
+                        f"Thử lại sau {delay} giây...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await asyncio.sleep(delay)
 
-        if not partial.is_file() or partial.stat().st_size < 128 or total_bytes == 0:
-            raise RuntimeError("Edge-TTS không tạo được tệp MP3 hợp lệ.")
-        os.replace(partial, destination)
-        return destination
+        raise RuntimeError(
+            f"Không tạo được audio sau {attempts} lần thử: {last_error}"
+        ) from last_error
     except Exception:
         partial.unlink(missing_ok=True)
         raise
