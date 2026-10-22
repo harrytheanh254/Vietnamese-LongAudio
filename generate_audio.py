@@ -10,7 +10,7 @@ VOICE_OPTIONS = {
     "vi-VN-NamMinhNeural": "Nam Minh",
     "vi-VN-HoaiMyNeural": "Hoài My",
 }
-RATE_OPTIONS = ("0.75", "1.0", "1.25", "1.5", "1.75")
+RATE_OPTIONS = ("0.75", "1.0", "1.25", "1.5", "1.75", "2.0")
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = BASE_DIR / "kichban.txt"
 DEFAULT_OUTPUT = BASE_DIR / "outputs" / "audio_youtube.mp3"
