@@ -62,6 +62,7 @@ jobs:
       - name: Materialize desktop-supplied script (if provided)
         env:
           SCRIPT_GZIP_B64: ${{ inputs.content_gzip_base64 || '' }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
         run: |
           python - <<'PY'
           import base64
@@ -73,6 +74,11 @@ jobs:
           if not encoded:
               print("No desktop payload supplied; using the checked-in kichban.txt.")
           else:
+              if os.environ.get("REPOSITORY_PRIVATE", "").lower() != "true":
+                  raise SystemExit(
+                      "Desktop payloads are disabled for public repositories. "
+                      "Make this repository private before sending story text."
+                  )
               try:
                   raw = gzip.decompress(base64.b64decode(encoded, validate=True))
                   text = raw.decode("utf-8-sig")
