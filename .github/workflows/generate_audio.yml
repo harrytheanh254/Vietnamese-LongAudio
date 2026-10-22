@@ -1,8 +1,20 @@
 name: Generate long audio
 
+run-name: "SẢNH TRUYỆN ${{ inputs.request_id || github.run_number }}"
+
 on:
   workflow_dispatch:
     inputs:
+      content_gzip_base64:
+        description: "Compressed UTF-8 script sent by SẢNH TRUYỆN; leave blank to use kichban.txt"
+        required: false
+        type: string
+        default: ""
+      request_id:
+        description: "Unique request identifier used by the desktop app"
+        required: false
+        type: string
+        default: ""
       voice:
         description: "Giọng đọc tiếng Việt"
         required: true
@@ -46,6 +58,31 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+
+      - name: Materialize desktop-supplied script (if provided)
+        env:
+          SCRIPT_GZIP_B64: ${{ inputs.content_gzip_base64 || '' }}
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          import os
+          from pathlib import Path
+
+          encoded = os.environ.get("SCRIPT_GZIP_B64", "").strip()
+          if not encoded:
+              print("No desktop payload supplied; using the checked-in kichban.txt.")
+          else:
+              try:
+                  raw = gzip.decompress(base64.b64decode(encoded, validate=True))
+                  text = raw.decode("utf-8-sig")
+              except Exception as exc:
+                  raise SystemExit(f"Desktop audio payload is invalid: {type(exc).__name__}: {exc}")
+              if not text.strip():
+                  raise SystemExit("Desktop supplied an empty script.")
+              Path("kichban.txt").write_text(text, encoding="utf-8")
+              print(f"Loaded desktop script into this runner only: {len(text):,} characters.")
+          PY
 
       - name: Install Edge-TTS with current protocol support
         run: |
