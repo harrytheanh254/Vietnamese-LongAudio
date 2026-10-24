@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -38,6 +39,7 @@ DRAFT_DIR = DATA_DIR / "drafts"
 TRANSLATION_RAW_DRAFT = DRAFT_DIR / "translation_raw_draft.txt"
 TRANSLATION_VI_DRAFT = DRAFT_DIR / "translation_vi_draft.txt"
 TRANSLATION_DRAFT_META = DRAFT_DIR / "translation_session.json"
+TRANSLATION_GROUPS_STATE = DRAFT_DIR / "translation_groups_state.json"
 EPUB_DIR = DATA_DIR / "epub"
 RAW_DIR = DATA_DIR / "raw"
 TRANSLATED_DIR = DATA_DIR / "translated"
@@ -1180,13 +1182,165 @@ class NovelStudioApp:
         content = self.vi_box.get("1.0", "end-1c")
         if not content.strip():
             messagebox.showwarning("Chưa có bản dịch", "Khung bản dịch đang trống."); return
-        default = (self.raw_path.stem + "_vi.txt") if self.raw_path else "ban_dich_vi.txt"
+        if self.raw_path:
+            group_number = getattr(self, "active_translation_group", None)
+            suffix = f"_nhom_{group_number:02d}_vi.txt" if group_number else "_vi.txt"
+            default = self.raw_path.stem + suffix
+        else:
+            default = "ban_dich_vi.txt"
         path = filedialog.asksaveasfilename(title="Lưu bản dịch", initialdir=str(TRANSLATED_DIR),
                                             initialfile=default, defaultextension=".txt",
                                             filetypes=[("Text", "*.txt")])
         if path:
             Path(path).write_text(content, encoding="utf-8")
             self.status.set(f"Đã lưu bản dịch: {Path(path).name}")
+
+    def _read_translation_group_state(self):
+        """Read persistent per-group progress; a damaged state file never blocks translation."""
+        try:
+            if TRANSLATION_GROUPS_STATE.is_file():
+                data = json.loads(TRANSLATION_GROUPS_STATE.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return {"groups": {}}
+
+    def _write_translation_group_state(self, data):
+        DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+        temp = TRANSLATION_GROUPS_STATE.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, TRANSLATION_GROUPS_STATE)
+
+    def _save_clipboard_group_progress(self, session):
+        """Save the active 15-chapter group's checkpoint after every accepted chunk."""
+        group_index = session.get("group_index")
+        source_key = session.get("source_key")
+        if group_index is None or not source_key:
+            return
+        try:
+            data = self._read_translation_group_state()
+            groups = data.setdefault("groups", {})
+            key = f"{source_key}:{group_index}"
+            groups[key] = {
+                "source_key": source_key,
+                "group_index": group_index,
+                "group_total": session.get("group_total", 1),
+                "group_start_chapter": session.get("group_start_chapter", 0),
+                "group_end_chapter": session.get("group_end_chapter", 0),
+                "chapter_count": session.get("chapter_count", 0),
+                "chapter_labels": session.get("chapter_labels", []),
+                "translations": session.get("translations", []),
+                "index": session.get("index", 0),
+                "story_context": session.get("story_context", ""),
+                "phase": session.get("phase", "research"),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "completed": session.get("index", 0) >= len(session.get("chunks", []))
+                    and session.get("phase") == "translation",
+            }
+            self._write_translation_group_state(data)
+        except (OSError, TypeError, ValueError) as exc:
+            self.status.set(f"Không lưu được tiến độ nhóm dịch: {exc}")
+
+    def _choose_translation_group(self, raw_text):
+        """Choose one 15-chapter group and restore its previously saved checkpoint."""
+        try:
+            chapters, labels = split_novel_into_chapters(raw_text)
+        except Exception as exc:
+            messagebox.showerror("Không thể chia nhóm chương", str(exc))
+            return None
+        if not chapters:
+            messagebox.showwarning("Không có nội dung", "Văn bản nguồn đang trống.")
+            return None
+
+        groups = []
+        for start in range(0, len(chapters), 15):
+            end = min(start + 15, len(chapters))
+            groups.append({
+                "start": start,
+                "end": end,
+                "source": "".join(chapters[start:end]),
+                "labels": labels[start:end],
+            })
+        source_key = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        saved = self._read_translation_group_state().get("groups", {})
+        dialog = tk.Toplevel(self.root)
+        dialog.title("SẢNH TRUYỆN · Chọn nhóm chương")
+        dialog.geometry("660x470")
+        dialog.minsize(540, 360)
+        dialog.configure(bg=BG)
+        dialog.transient(self.root)
+        tk.Label(
+            dialog, text="CHỌN NHÓM ĐỂ DỊCH", bg=BG, fg=BRASS,
+            font=(FONT, 13, "bold"), anchor="w"
+        ).pack(fill="x", padx=18, pady=(16, 4))
+        tk.Label(
+            dialog,
+            text="Mỗi nhóm tối đa 15 chương; nhóm được dịch lần lượt theo từng lượt 3 chương. "
+                 "Tiến độ và hồ sơ truyện được lưu trên máy, có thể đóng ứng dụng rồi làm tiếp.",
+            bg=BG, fg=MUTED, font=(FONT, 9), justify="left", wraplength=610, anchor="w"
+        ).pack(fill="x", padx=18, pady=(0, 10))
+        listing = tk.Listbox(
+            dialog, bg=PANEL, fg=INK, selectbackground=RED, selectforeground=INK,
+            font=(FONT, 10), relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, activestyle="none"
+        )
+        listing.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        for idx, group in enumerate(groups):
+            key = f"{source_key}:{idx}"
+            progress = saved.get(key, {})
+            done = int(progress.get("index", 0) or 0)
+            chunks_total = (group["end"] - group["start"] + 2) // 3
+            if progress.get("completed"):
+                status = "HOÀN TẤT"
+            elif done:
+                status = f"ĐANG DỞ · xong {done}/{chunks_total} lượt"
+            else:
+                status = "CHƯA DỊCH"
+            listing.insert(
+                "end",
+                f"Nhóm {idx + 1:02d} · Chương {group['start'] + 1}–{group['end']} "
+                f"· {group['labels'][0]} → {group['labels'][-1]} · {status}"
+            )
+        listing.selection_set(0)
+        listing.activate(0)
+        chosen = {"value": None}
+
+        def confirm():
+            selection = listing.curselection()
+            if not selection:
+                messagebox.showwarning("Chưa chọn nhóm", "Hãy chọn một nhóm chương.", parent=dialog)
+                return
+            idx = int(selection[0])
+            group = groups[idx]
+            key = f"{source_key}:{idx}"
+            progress = saved.get(key, {})
+            if progress.get("completed"):
+                if not messagebox.askyesno(
+                    "Dịch lại nhóm đã hoàn tất?",
+                    f"Nhóm {idx + 1} đã hoàn tất. Bắt đầu lại nhóm này sẽ xóa tiến độ đã lưu của riêng nhóm đó. Tiếp tục?",
+                    parent=dialog,
+                ):
+                    return
+                progress = {}
+            chosen["value"] = {
+                "source": group["source"],
+                "source_key": source_key,
+                "group_index": idx,
+                "group_total": len(groups),
+                "group_start_chapter": group["start"],
+                "group_end_chapter": group["end"],
+                "progress": progress,
+            }
+            dialog.destroy()
+
+        controls = tk.Frame(dialog, bg=BG)
+        controls.pack(fill="x", padx=18, pady=(0, 16))
+        self._button(controls, "DỊCH NHÓM ĐÃ CHỌN", confirm, True)
+        self._button(controls, "HỦY", dialog.destroy)
+        listing.bind("<Double-Button-1>", lambda _event: confirm())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.wait_window()
+        return chosen["value"]
 
     def start_translation(self):
         if self.translation_running:
@@ -1216,13 +1370,24 @@ class NovelStudioApp:
         output = TRANSLATED_DIR / ((self.raw_path.stem if self.raw_path else "ban_dich") + "_vi.txt")
         self.translation_running = True
         if selected_translation_mode.startswith("ChatGPT · Qua clipboard"):
+            group_info = self._choose_translation_group(raw)
+            if not group_info:
+                self.translation_running = False
+                return
             title = self.story_title_var.get().strip() if hasattr(self, "story_title_var") else ""
             if not title and self.raw_path:
                 title = self.raw_path.stem
+            group_number = group_info["group_index"] + 1
+            output = TRANSLATED_DIR / (
+                (self.raw_path.stem if self.raw_path else "ban_dich")
+                + f"_nhom_{group_number:02d}_vi.txt"
+            )
+            self.active_translation_group = group_number
             self._start_chatgpt_clipboard_session(
-                raw, output, glossary_path, profile_name,
+                group_info["source"], output, glossary_path, profile_name,
                 source_mode=source_mode,
-                novel_title=title
+                novel_title=title,
+                group_info=group_info,
             )
         elif self.translation_mode_var.get().startswith("ChatGPT"):
             self.translate_note.configure(text=f"Đang chuẩn bị dịch văn học bằng ChatGPT · {profile_name}...")
@@ -1245,6 +1410,7 @@ class NovelStudioApp:
         profile_name: str,
         source_mode: str = "Dịch raw Trung",
         novel_title: str = "",
+        group_info: dict | None = None,
     ):
         try:
             with glossary_path.open("r", encoding="utf-8-sig") as stream:
@@ -1277,6 +1443,20 @@ class NovelStudioApp:
                 return
             self.vi_box.delete("1.0", "end")
 
+        restored = (group_info or {}).get("progress", {})
+        restored_translations = restored.get("translations", [])
+        if not isinstance(restored_translations, list):
+            restored_translations = []
+        restored_translations = [str(item) for item in restored_translations]
+        restored_index = max(0, min(int(restored.get("index", 0) or 0), len(batches)))
+        restored_context = str(restored.get("story_context", "") or "")
+        restored_phase = "translation" if restored_context else "research"
+        if restored_phase == "translation" and restored_index >= len(batches):
+            restored_index = 0
+            restored_translations = []
+            restored_context = ""
+            restored_phase = "research"
+
         session = {
             "source": source_text,
             "output": output,
@@ -1288,10 +1468,15 @@ class NovelStudioApp:
             "chapter_labels": chapter_labels,
             "chapters_per_batch": 3,
             "chunks": batches,
-            "translations": [],
-            "index": 0,
-            "phase": "research",
-            "story_context": "",
+            "translations": restored_translations,
+            "index": restored_index,
+            "phase": restored_phase,
+            "story_context": restored_context,
+            "source_key": (group_info or {}).get("source_key"),
+            "group_index": (group_info or {}).get("group_index"),
+            "group_total": (group_info or {}).get("group_total", 1),
+            "group_start_chapter": (group_info or {}).get("group_start_chapter", 0),
+            "group_end_chapter": (group_info or {}).get("group_end_chapter", chapter_count),
             "expected_prefix": "",
             "window": None,
             "prompt_box": None,
@@ -1302,12 +1487,26 @@ class NovelStudioApp:
             "controls": None,
         }
         self.clipboard_translation_session = session
+        if restored_translations:
+            self.vi_box.delete("1.0", "end")
+            self.vi_box.insert("1.0", "\n\n".join(restored_translations))
+            self.vi_box.mark_set("insert", "end-1c")
+            self.vi_box.see("end")
+        else:
+            self.vi_box.delete("1.0", "end")
         self._open_chatgpt_clipboard_window(session)
         self._manual_show_current_chunk(session)
         self._manual_update_controls(session)
         self._manual_copy_prompt()
+        self._save_clipboard_group_progress(session)
+        group_note = (
+            f" · Nhóm {session['group_index'] + 1}/{session['group_total']}"
+            if session.get("group_index") is not None else ""
+        )
         self._set_chatgpt_progress(
-            f"Đã chuẩn bị {chapter_count} chương thành {len(batches)} lượt. Prompt nghiên cứu truyện đã sao chép."
+            f"Đã chuẩn bị {chapter_count} chương thành {len(batches)} lượt{group_note}. "
+            + ("Đã khôi phục tiến độ; prompt lượt dịch đã sao chép." if session["phase"] == "translation"
+               else "Prompt nghiên cứu truyện đã sao chép.")
         )
 
     def _open_chatgpt_clipboard_window(self, session: dict):
@@ -1547,13 +1746,19 @@ class NovelStudioApp:
         self.vi_box.see("end")
         session["translations"].append(new_answer)
         session["index"] += 1
+        self._save_clipboard_group_progress(session)
 
         if session["index"] >= total:
             window = session.get("window")
+            self._save_clipboard_group_progress(session)
             self.clipboard_translation_session = None
             self.translation_running = False
+            group_note = (
+                f" của nhóm {session['group_index'] + 1}/{session['group_total']}"
+                if session.get("group_index") is not None else ""
+            )
             self.translate_note.configure(
-                text=f"Đã gom đủ {session['chapter_count']} chương trong {total} lượt · hãy bấm LƯU BẢN DỊCH."
+                text=f"Đã gom đủ {session['chapter_count']} chương{group_note} trong {total} lượt · hãy bấm LƯU BẢN DỊCH."
             )
             self.status.set("Đã dịch xong qua ChatGPT clipboard. Hãy bấm LƯU BẢN DỊCH để lưu TXT.")
             if window is not None and window.winfo_exists():
@@ -1602,6 +1807,7 @@ class NovelStudioApp:
         session["story_context"] = story_context
         session["phase"] = "translation"
         session["index"] = 0
+        self._save_clipboard_group_progress(session)
         self._manual_show_current_chunk(session)
         self._manual_update_controls(session)
         self._manual_copy_prompt()
@@ -1615,6 +1821,7 @@ class NovelStudioApp:
     def _manual_cancel_session(self):
         session = getattr(self, "clipboard_translation_session", None)
         if session:
+            self._save_clipboard_group_progress(session)
             window = session.get("window")
             self.clipboard_translation_session = None
             self.translation_running = False
