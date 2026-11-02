@@ -5,9 +5,9 @@ import hmac
 import os
 import queue
 import secrets
+import shutil
 import sqlite3
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,7 +24,15 @@ from flask import (
     url_for,
 )
 
-from generate_audio import RATE_OPTIONS, VOICE_OPTIONS, synthesize_one_audio
+from generate_audio import (
+    CHUNK_CHARS,
+    MAX_CONCURRENT_SEGMENTS,
+    RATE_OPTIONS,
+    VOICE_OPTIONS,
+    ChunkSynthesisError,
+    split_text_into_chunks,
+    synthesize_text_in_chunks,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("TTS_DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
@@ -65,6 +73,7 @@ def connect_db() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA foreign_keys=ON")
     return connection
 
 
@@ -86,15 +95,62 @@ def initialize_db() -> None:
             )
             """
         )
-        # A server restart may interrupt a generation. Re-queue unfinished jobs;
-        # synthesize_one_audio removes any stale partial MP3 before retrying.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS job_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                segment_index INTEGER NOT NULL,
+                char_count INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                error TEXT,
+                audio_path TEXT,
+                UNIQUE(job_id, segment_index)
+            )
+            """
+        )
+        # Interrupted parent jobs are re-queued and their segments are rebuilt.
         db.execute(
             "UPDATE jobs SET status='queued', started_at=NULL "
             "WHERE status='generating'"
         )
+        db.execute(
+            "UPDATE job_segments SET status='queued', started_at=NULL "
+            "WHERE status='generating'"
+        )
 
 
-def job_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def segment_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    path = row["audio_path"]
+    return {
+        "id": row["id"],
+        "index": row["segment_index"],
+        "label": f"Đoạn {row['segment_index']}",
+        "char_count": row["char_count"],
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "error": row["error"],
+        "has_audio": bool(path and Path(path).is_file()),
+    }
+
+
+def job_to_dict(
+    row: sqlite3.Row, segments: list[sqlite3.Row] | None = None
+) -> dict[str, Any]:
+    segment_rows = segments
+    if segment_rows is None:
+        with connect_db() as db:
+            segment_rows = db.execute(
+                "SELECT * FROM job_segments WHERE job_id=? ORDER BY segment_index",
+                (row["id"],),
+            ).fetchall()
+    segment_data = [segment_to_dict(segment) for segment in (segment_rows or [])]
+    completed = sum(segment["status"] == "completed" for segment in segment_data)
+    failed = sum(segment["status"] == "failed" for segment in segment_data)
+    audio_path = row["audio_path"]
     return {
         "id": row["id"],
         "label": f"AU {row['id']}",
@@ -106,7 +162,11 @@ def job_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "started_at": row["started_at"],
         "completed_at": row["completed_at"],
         "error": row["error"],
-        "has_audio": bool(row["audio_path"] and Path(row["audio_path"]).is_file()),
+        "has_audio": bool(audio_path and Path(audio_path).is_file()),
+        "segment_count": len(segment_data),
+        "completed_segments": completed,
+        "failed_segments": failed,
+        "segments": segment_data,
     }
 
 
@@ -140,27 +200,42 @@ def set_job_status(
             WHERE id=?
             """,
             (
-                status,
-                started_at,
-                completed_at,
-                error,
-                audio_path,
-                int(clear_text),
-                job_id,
+                status, started_at, completed_at, error, audio_path,
+                int(clear_text), job_id,
+            ),
+        )
+
+
+def set_segment_status(
+    job_id: int,
+    segment_index: int,
+    status: str,
+    *,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    error: str | None = None,
+    audio_path: str | None = None,
+) -> None:
+    with connect_db() as db:
+        db.execute(
+            """
+            UPDATE job_segments SET status=?,
+                started_at=COALESCE(?, started_at),
+                completed_at=COALESCE(?, completed_at),
+                error=?, audio_path=?
+            WHERE job_id=? AND segment_index=?
+            """,
+            (
+                status, started_at, completed_at, error, audio_path,
+                job_id, segment_index,
             ),
         )
 
 
 def process_job(job_id: int) -> None:
-    with connect_db() as db:
-        row = db.execute(
-            "SELECT id, status, voice, rate, source_text FROM jobs WHERE id=?",
-            (job_id,),
-        ).fetchone()
-
+    row = get_job(job_id, include_text=True)
     if row is None or row["status"] not in {"queued", "generating"}:
         return
-
     text = row["source_text"]
     if not text or not text.strip():
         set_job_status(
@@ -175,32 +250,80 @@ def process_job(job_id: int) -> None:
     voice = row["voice"]
     rate = row["rate"]
     output_path = AUDIO_DIR / f"AU {job_id}.mp3"
+    segment_dir = AUDIO_DIR / f"AU {job_id}_parts"
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     set_job_status(job_id, "generating", started_at=utc_now(), error=None)
 
     try:
-        asyncio.run(
-            synthesize_one_audio(
+        chunks = split_text_into_chunks(text, CHUNK_CHARS)
+        if not chunks:
+            raise ValueError("Nội dung cần chuyển thành audio đang trống.")
+
+        # A restarted job begins cleanly from its original source text.
+        shutil.rmtree(segment_dir, ignore_errors=True)
+        output_path.unlink(missing_ok=True)
+        with connect_db() as db:
+            db.execute("DELETE FROM job_segments WHERE job_id=?", (job_id,))
+            db.executemany(
+                """
+                INSERT INTO job_segments(job_id, segment_index, char_count, status)
+                VALUES(?, ?, ?, 'queued')
+                """,
+                [
+                    (job_id, index, len(chunk))
+                    for index, chunk in enumerate(chunks, start=1)
+                ],
+            )
+
+        def update_segment(
+            index: int,
+            status: str,
+            error: str | None,
+            path: Path | None,
+        ) -> None:
+            set_segment_status(
+                job_id,
+                index,
+                status,
+                started_at=utc_now() if status == "generating" else None,
+                completed_at=utc_now() if status in {"completed", "failed"} else None,
+                error=error,
+                audio_path=str(path) if path else None,
+            )
+
+        result, _, _ = asyncio.run(
+            synthesize_text_in_chunks(
                 text=text,
                 voice=voice,
                 rate=rate,
                 output_path=output_path,
+                segment_dir=segment_dir,
+                max_chars=CHUNK_CHARS,
+                concurrency=MAX_CONCURRENT_SEGMENTS,
                 attempts=3,
+                status_callback=update_segment,
             )
         )
-        if not output_path.is_file() or output_path.stat().st_size < 128:
-            raise RuntimeError("Tệp MP3 đầu ra rỗng hoặc không hợp lệ.")
+        if not result.is_file() or result.stat().st_size == 0:
+            raise RuntimeError("Tệp MP3 cuối cùng rỗng hoặc không hợp lệ.")
         set_job_status(
             job_id,
             "completed",
             completed_at=utc_now(),
-            audio_path=str(output_path),
+            audio_path=str(result),
             error=None,
             clear_text=True,
         )
-    except Exception as exc:  # Keep a failed AU in history; never reuse its number.
-        partial_path = output_path.with_name(output_path.stem + ".partial" + output_path.suffix)
-        partial_path.unlink(missing_ok=True)
+    except ChunkSynthesisError as exc:
+        set_job_status(
+            job_id,
+            "failed",
+            completed_at=utc_now(),
+            error=str(exc)[:1500],
+            audio_path=None,
+            clear_text=True,
+        )
+    except Exception as exc:
         output_path.unlink(missing_ok=True)
         message = str(exc).strip() or exc.__class__.__name__
         set_job_status(
@@ -260,16 +383,12 @@ def local_request() -> bool:
 def protect_web_app():
     if request.endpoint == "health":
         return None
-
-    # Local development can be used without a password. A network-hosted app
-    # refuses non-local connections until a password is configured.
     if not APP_PASSWORD and not local_request():
         return (
             "Ứng dụng chưa được bảo vệ. Hãy đặt biến môi trường WEB_APP_PASSWORD "
             "trước khi mở website ra Internet.",
             503,
         )
-
     if not APP_PASSWORD or request.endpoint in {"login", "static"}:
         return None
     if session.get("authenticated"):
@@ -314,6 +433,8 @@ def index():
         voices=VOICE_OPTIONS,
         rates=RATE_OPTIONS,
         password_enabled=bool(APP_PASSWORD),
+        chunk_chars=CHUNK_CHARS,
+        concurrency=MAX_CONCURRENT_SEGMENTS,
     )
 
 
@@ -321,9 +442,9 @@ def index():
 def list_jobs():
     start_worker()
     try:
-        limit = int(request.args.get("limit", "60"))
+        limit = int(request.args.get("limit", "80"))
     except ValueError:
-        limit = 60
+        limit = 80
     limit = min(max(limit, 1), 200)
     with connect_db() as db:
         rows = db.execute(
@@ -334,7 +455,14 @@ def list_jobs():
             """,
             (limit,),
         ).fetchall()
-    return jsonify({"jobs": [job_to_dict(row) for row in rows]})
+        jobs = []
+        for row in rows:
+            segments = db.execute(
+                "SELECT * FROM job_segments WHERE job_id=? ORDER BY segment_index",
+                (row["id"],),
+            ).fetchall()
+            jobs.append(job_to_dict(row, segments))
+    return jsonify({"jobs": jobs})
 
 
 @app.post("/api/jobs")
@@ -344,7 +472,6 @@ def create_job():
     content = payload.get("content")
     voice = payload.get("voice")
     rate = str(payload.get("rate", ""))
-
     if not isinstance(content, str) or not content.strip():
         return jsonify({"error": "Hãy nhập nội dung cần chuyển thành audio."}), 400
     if voice not in VOICE_OPTIONS:
@@ -362,11 +489,8 @@ def create_job():
             (voice, rate, created_at, content),
         )
         job_id = int(cursor.lastrowid)
-
-    # Number is allocated before queueing, so failures never renumber later jobs.
     job_queue.put(job_id)
-    row = get_job(job_id)
-    return jsonify({"job": job_to_dict(row)}), 201
+    return jsonify({"job": job_to_dict(get_job(job_id))}), 201
 
 
 @app.get("/api/jobs/<int:job_id>/audio")
@@ -375,17 +499,44 @@ def get_audio(job_id: int):
     if row is None:
         abort(404)
     if row["status"] != "completed" or not row["audio_path"]:
-        return jsonify({"error": "Audio chưa sẵn sàng."}), 409
+        return jsonify({"error": "Audio hoàn chỉnh chưa sẵn sàng."}), 409
     path = Path(row["audio_path"])
     if not path.is_file():
         return jsonify({"error": "Không tìm thấy tệp audio trên ổ lưu trữ."}), 410
-
     download = request.args.get("download") == "1"
     return send_file(
         path,
         mimetype="audio/mpeg",
         as_attachment=download,
         download_name=f"AU {job_id}.mp3",
+        conditional=True,
+        max_age=0,
+    )
+
+
+@app.get("/api/jobs/<int:job_id>/segments/<int:segment_index>/audio")
+def get_segment_audio(job_id: int, segment_index: int):
+    with connect_db() as db:
+        row = db.execute(
+            """
+            SELECT status, audio_path FROM job_segments
+            WHERE job_id=? AND segment_index=?
+            """,
+            (job_id, segment_index),
+        ).fetchone()
+    if row is None:
+        abort(404)
+    if row["status"] != "completed" or not row["audio_path"]:
+        return jsonify({"error": "Đoạn audio này chưa sẵn sàng."}), 409
+    path = Path(row["audio_path"])
+    if not path.is_file():
+        return jsonify({"error": "Không tìm thấy tệp audio của đoạn này."}), 410
+    download = request.args.get("download") == "1"
+    return send_file(
+        path,
+        mimetype="audio/mpeg",
+        as_attachment=download,
+        download_name=f"AU {job_id} - Doan {segment_index}.mp3",
         conditional=True,
         max_age=0,
     )
