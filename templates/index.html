@@ -27,7 +27,7 @@
         <div>
           <p class="eyebrow">TEXT TO SPEECH</p>
           <h1>Sinh giọng từ văn bản</h1>
-          <p class="muted intro">Dán nội dung truyện, chọn giọng đọc và tốc độ. Mỗi lần nhấn tạo sẽ có một mã AU riêng.</p>
+          <p class="muted intro">Dán nội dung truyện, chọn giọng đọc và tốc độ. Văn bản được chia thành các đoạn tối đa {{ chunk_chars|int }} ký tự; tối đa {{ concurrency }} đoạn được tạo đồng thời rồi ghép thành một MP3.</p>
         </div>
       </div>
 
@@ -60,7 +60,7 @@
         </div>
 
         <div class="form-footer">
-          <p class="privacy-note"><span aria-hidden="true">🔒</span> Nội dung chỉ được lưu tạm khi đang xử lý; khi hoàn tất hoặc lỗi, văn bản sẽ bị xóa khỏi hàng đợi.</p>
+          <p class="privacy-note"><span aria-hidden="true">🔒</span> Nội dung được lưu tạm trong lúc tạo các đoạn; khi toàn bộ lượt hoàn tất hoặc thất bại, văn bản sẽ được xóa.</p>
           <button id="submit-button" class="primary-button" type="submit">
             <span class="button-icon" aria-hidden="true">▶</span>
             <span id="submit-label">Tạo audio</span>
@@ -87,11 +87,11 @@
         <div class="card-heading">
           <div>
             <p class="eyebrow">YOUR LIBRARY</p>
-            <h2>Gần đây</h2>
+            <h2>Tất cả tác vụ</h2>
           </div>
           <button id="refresh-button" class="text-button" type="button">Làm mới ↻</button>
         </div>
-        <p class="muted history-helper">Số AU được cấp theo thứ tự bạn nhấn tạo, không đổi khi một lượt thất bại.</p>
+        <p class="muted history-helper">Mở từng tác vụ để xem danh sách đoạn, trạng thái và tải từng đoạn riêng lẻ.</p>
         <div id="history-list" class="history-list">
           <div class="history-empty">Chưa có lượt tạo audio nào.</div>
         </div>
@@ -110,7 +110,7 @@
 
   <footer class="footer">
     <span>Vietnamese Long Audio Studio</span>
-    <span>Audio được tạo tuần tự để hạn chế lỗi dịch vụ.</span>
+    <span>Chia đoạn 5.000 ký tự · tối đa 30 đoạn đồng thời · ghép thành một MP3.</span>
   </footer>
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
