@@ -118,10 +118,10 @@ jobs:
           if text.strip() == "__DAN_NOI_DUNG_TRUYEN_VAO_DAY__":
               sys.exit("Hãy thay dòng hướng dẫn trong kichban.txt bằng nội dung truyện.")
           print(f"Đã nhận kichban.txt: {len(text):,} ký tự.")
-          print("Sẽ tạo một MP3 đầu ra từ toàn bộ kịch bản.")
+          print("Sẽ chia văn bản thành đoạn tối đa 5.000 ký tự, tạo tối đa 30 đoạn đồng thời rồi ghép thành một MP3.")
           PY
 
-      - name: Generate one MP3 from the whole script
+      - name: Generate concurrent chunks and merge one MP3
         env:
           VOICE_CHOICE: ${{ inputs.voice || 'Nam Minh' }}
           RATE: ${{ inputs.rate || '1.25' }}
@@ -132,8 +132,8 @@ jobs:
             *) echo "::error::Giọng đọc không hợp lệ"; exit 1 ;;
           esac
 
-          # One whole-script synthesis and one output MP3.
-          # Edge-TTS may internally stream text fragments to its service.
+          # Chia văn bản thành các đoạn 5.000 ký tự, tổng hợp tối đa 30 đoạn đồng thời.
+          # Sau khi mọi đoạn hoàn tất, generate_audio.py ghép chúng thành một MP3.
           OUTPUT_FILE="outputs/AU ${{ github.run_number }}.mp3"
           echo "AU ID: ${{ github.run_number }}"
           echo "Output: $OUTPUT_FILE"
@@ -143,6 +143,8 @@ jobs:
               --output "$OUTPUT_FILE" \
               --voice "$VOICE_ID" \
               --rate "$RATE" \
+              --chunk-size 5000 \
+              --concurrency 30 \
               --attempts 3
 
       - name: Upload MP3
