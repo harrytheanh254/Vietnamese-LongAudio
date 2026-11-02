@@ -6,7 +6,7 @@ Công cụ chuyển văn bản tiếng Việt thành audio bằng giọng đọc
 
 Giao diện gồm khung nhập nội dung, chọn **Nam Minh / Hoài My**, chọn tốc độ, khu vực kết quả có đồng hồ thời gian chạy và lịch sử audio. Mỗi lần bấm **Tạo audio**, hệ thống cấp mã `AU 1`, `AU 2`, ... ngay khi nhận yêu cầu. Mã không được tính lại theo thứ tự hoàn tất: nếu `AU 2` xong trước `AU 1`, số AU vẫn giữ nguyên.
 
-Khi tạo audio, lượt mới được xếp vào hàng đợi và tổng hợp lần lượt để hạn chế các yêu cầu đồng thời tới dịch vụ. Trạng thái hiển thị gồm đang chờ, đang tạo, hoàn tất hoặc thất bại. Khi thành công, có thể nghe trực tiếp hoặc tải MP3. Nội dung văn bản được lưu tạm trong cơ sở dữ liệu khi công việc đang chờ/xử lý và tự xóa khỏi bản ghi khi đã thành công hoặc thất bại; lịch sử vẫn giữ mã AU, giọng, tốc độ, trạng thái và đường dẫn audio. File lưu và tên khi tải xuống dùng đúng mã được cấp lúc gửi yêu cầu, dạng `AU 1.mp3`, `AU 2.mp3`, ...; vì mã dựa trên ID của lượt gửi chứ không dựa trên thời điểm hoàn tất, AU 2 hoàn thành trước AU 1 vẫn giữ đúng tên của nó.
+Khi tạo audio, lượt mới được xếp vào hàng đợi. Văn bản được chia thành các đoạn tối đa 5.000 ký tự; tối đa 30 đoạn được tổng hợp đồng thời. Khi tất cả đoạn hoàn tất, các luồng MP3 được ghép theo đúng thứ tự văn bản thành một file AU duy nhất. Trạng thái hiển thị gồm trạng thái tổng của AU và trạng thái riêng của từng đoạn; có thể mở danh sách đoạn trong mục lịch sử để theo dõi hoặc tải từng đoạn. Khi thành công, có thể nghe trực tiếp hoặc tải MP3. Nội dung văn bản được lưu tạm trong cơ sở dữ liệu khi công việc đang chờ/xử lý và tự xóa khỏi bản ghi khi đã thành công hoặc thất bại; lịch sử vẫn giữ mã AU, giọng, tốc độ, trạng thái và đường dẫn audio. File lưu và tên khi tải xuống dùng đúng mã được cấp lúc gửi yêu cầu, dạng `AU 1.mp3`, `AU 2.mp3`, ...; vì mã dựa trên ID của lượt gửi chứ không dựa trên thời điểm hoàn tất, AU 2 hoàn thành trước AU 1 vẫn giữ đúng tên của nó.
 
 ### Chạy trên máy cá nhân
 
@@ -17,7 +17,7 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-Mở địa chỉ [http://127.0.0.1:5000](http://127.0.0.1:5000). Không cần chạy Flask bằng lệnh riêng nào khác. Audio và lịch sử mặc định được lưu trong thư mục runtime `data/`, thư mục này đã được thêm vào `.gitignore` để tránh commit nhầm audio hoặc cơ sở dữ liệu riêng tư.
+Mở địa chỉ [http://127.0.0.1:5000](http://127.0.0.1:5000). Không cần chạy Flask bằng lệnh riêng nào khác. Audio, các MP3 đoạn tạm và lịch sử mặc định được lưu trong thư mục runtime `data/`, thư mục này đã được thêm vào `.gitignore` để tránh commit nhầm audio hoặc cơ sở dữ liệu riêng tư.
 
 ### Đưa website lên Internet bằng Render
 
@@ -43,7 +43,7 @@ Nếu muốn chạy trực tiếp từ GitHub mà không dùng giao diện web:
 3. Mỗi lượt chạy có mã theo thứ tự GitHub cấp lúc tạo run: file đầu ra dạng `AU 1.mp3`, `AU 2.mp3`, ... và artifact tương ứng dạng `AU 1`, `AU 2`, ...
 4. Tải artifact của đúng lượt chạy. Nếu chạy lại cùng một lượt bị lỗi, nó giữ mã AU của lượt đó; lượt chạy mới tiếp theo nhận số mới.
 
-Workflow Actions tạo một MP3 đầu ra từ toàn bộ file `kichban.txt`; Edge-TTS tự xử lý việc chia luồng văn bản nội bộ theo giao thức của nó. Lượt chạy này độc lập với thư viện AU được tạo trong giao diện web.
+Workflow Actions chia file `kichban.txt` thành các đoạn tối đa 5.000 ký tự, tổng hợp tối đa 30 đoạn đồng thời rồi ghép theo thứ tự thành một MP3 đầu ra. Lượt chạy này độc lập với thư viện AU được tạo trong giao diện web.
 
 **Cảnh báo repository công khai:** `kichban.txt` hiện được Git theo dõi trong repository Public, nên nội dung trong file là công khai. Hãy chuyển repository sang Private hoặc loại bỏ văn bản nhạy cảm trước khi đưa truyện riêng tư lên GitHub.
 
@@ -51,13 +51,13 @@ Workflow Actions tạo một MP3 đầu ra từ toàn bộ file `kichban.txt`; E
 
 Dịch vụ đọc trực tuyến của Edge đã thay đổi cách bắt tay WebSocket trong tháng 10/2026. Dự án đang ghim một commit của Edge-TTS upstream có hỗ trợ định dạng Sec-MS-GEC v2, thay vì ghép endpoint thay thế với thư viện dùng giao thức cũ. Xem [bản sửa upstream](https://github.com/rany2/edge-tts/pull/492).
 
-Edge-TTS dùng dịch vụ trực tuyến không có API ổn định được Microsoft cam kết hỗ trợ; dịch vụ có thể thay đổi hoặc giới hạn yêu cầu bất cứ lúc nào. Mã HTTP 429 có thể là giới hạn phía dịch vụ. Nếu vẫn gặp 429, hãy chờ một lúc trước khi chạy lại; đừng liên tục thử lại cả truyện dài.
+Edge-TTS dùng dịch vụ trực tuyến không có API ổn định được Microsoft cam kết hỗ trợ; dịch vụ có thể thay đổi hoặc giới hạn yêu cầu bất cứ lúc nào. Mã HTTP 429 có thể là giới hạn phía dịch vụ. Nếu vẫn gặp 429, hãy chờ một lúc trước khi chạy lại; đừng liên tục thử lại cả truyện dài. Có thể giảm tham số `--concurrency` khi chạy bằng dòng lệnh.
 
 ## Giới hạn thực tế
 
 - Không đặt giới hạn số ký tự tổng trong ứng dụng web hoặc trình tạo audio. Tuy nhiên, dịch vụ tổng hợp vẫn có thể áp dụng giới hạn riêng.
 - Tốc độ hiển thị chỉ là ước tính độ dài audio dựa trên số từ, không phải cam kết thời gian xử lý.
-- Công việc audio dài phụ thuộc vào độ ổn định của dịch vụ Edge Neural, mạng và tài nguyên máy chủ. Ứng dụng không có phần trăm tiến độ chính xác từ dịch vụ, vì vậy hiển thị trạng thái cùng đồng hồ thời gian thay vì phần trăm giả.
+- Công việc audio dài phụ thuộc vào độ ổn định của dịch vụ Edge Neural, mạng và tài nguyên máy chủ. 30 kết nối đồng thời có thể gặp giới hạn 429 từ dịch vụ; ứng dụng thử lại từng đoạn riêng. Ứng dụng không có phần trăm tiến độ chính xác từ dịch vụ, vì vậy hiển thị số đoạn đã hoàn tất/tổng số đoạn cùng đồng hồ thời gian.
 - Với GitHub Actions, thời gian chạy và thời hạn lưu artifact phụ thuộc giới hạn GitHub Actions. Artifact audio của workflow hiện giữ 14 ngày.
 
 ## Kiểm thử
