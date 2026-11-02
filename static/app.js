@@ -12,6 +12,7 @@ const currentStatus = document.getElementById("current-status");
 let jobs = [];
 let newestLocalJobId = null;
 let fetching = false;
+const expandedSegmentJobs = new Set();
 
 const statusText = {
   queued: "Đang chờ",
@@ -88,6 +89,60 @@ function createAudio(job, compact) {
   return wrap;
 }
 
+function createSegmentList(job) {
+  if (!job.segments || job.segments.length === 0) return null;
+
+  const details = document.createElement("details");
+  details.className = "segment-details";
+  details.open = expandedSegmentJobs.has(String(job.id));
+  details.addEventListener("toggle", () => {
+    if (details.open) expandedSegmentJobs.add(String(job.id));
+    else expandedSegmentJobs.delete(String(job.id));
+  });
+
+  const summary = document.createElement("summary");
+  const completed = job.completed_segments || 0;
+  const total = job.segment_count || job.segments.length;
+  summary.textContent = "Danh sách đoạn · " + completed + "/" + total + " hoàn tất";
+  details.appendChild(summary);
+
+  const list = document.createElement("div");
+  list.className = "segment-list";
+  job.segments.forEach((segment) => {
+    const item = document.createElement("div");
+    item.className = "segment-item";
+
+    const info = document.createElement("div");
+    info.className = "segment-info";
+    const title = document.createElement("strong");
+    title.textContent = segment.label || ("Đoạn " + segment.index);
+    const count = document.createElement("span");
+    count.textContent = Number(segment.char_count || 0).toLocaleString("vi-VN") + " ký tự";
+    info.append(title, count);
+
+    const state = document.createElement("span");
+    state.className = "status-pill " + statusClass(segment.status);
+    state.textContent = statusText[segment.status] || segment.status;
+    item.append(info, state);
+
+    if (segment.status === "completed" && segment.has_audio) {
+      const download = document.createElement("a");
+      download.className = "segment-download";
+      download.href = "/api/jobs/" + job.id + "/segments/" + segment.index + "/audio?download=1";
+      download.textContent = "Tải đoạn";
+      item.appendChild(download);
+    } else if (segment.status === "failed" && segment.error) {
+      const error = document.createElement("p");
+      error.className = "segment-error";
+      error.textContent = segment.error;
+      item.appendChild(error);
+    }
+    list.appendChild(item);
+  });
+  details.appendChild(list);
+  return details;
+}
+
 function renderCurrent(job) {
   if (!job) {
     setStatus(currentStatus, "idle");
@@ -136,21 +191,30 @@ function renderCurrent(job) {
     timer.textContent = formatElapsed(elapsedSeconds(job));
     timerRow.append(note, timer);
     currentResult.appendChild(timerRow);
-    const track = document.createElement("div");
-    track.className = "progress-track";
-    const bar = document.createElement("span");
-    track.appendChild(bar);
-    currentResult.appendChild(track);
-    const detail = document.createElement("p");
-    detail.className = "job-meta";
-    detail.textContent = job.status === "queued"
-      ? "Tác vụ sẽ bắt đầu khi lượt trước hoàn tất."
-      : "Dịch vụ đang tổng hợp giọng nói. Không có phần trăm giả lập; đồng hồ vẫn chạy.";
-    currentResult.appendChild(detail);
+
+    const done = job.completed_segments || 0;
+    const total = job.segment_count || 0;
+    if (total > 0) {
+      const progress = document.createElement("p");
+      progress.className = "job-meta segment-count";
+      progress.textContent = done + "/" + total + " đoạn đã hoàn tất · tối đa 30 đoạn chạy đồng thời";
+      currentResult.appendChild(progress);
+      const track = document.createElement("div");
+      track.className = "progress-track segment-progress";
+      const bar = document.createElement("span");
+      bar.style.width = Math.round((done / total) * 100) + "%";
+      track.appendChild(bar);
+      currentResult.appendChild(track);
+    } else {
+      const detail = document.createElement("p");
+      detail.className = "job-meta";
+      detail.textContent = "Đang chuẩn bị chia văn bản thành các đoạn.";
+      currentResult.appendChild(detail);
+    }
   } else if (job.status === "completed" && job.has_audio) {
     const done = document.createElement("p");
     done.className = "job-meta";
-    done.textContent = "Audio đã sẵn sàng · hoàn tất lúc " + formatDate(job.completed_at);
+    done.textContent = "Đã ghép " + job.segment_count + " đoạn thành một MP3 · hoàn tất lúc " + formatDate(job.completed_at);
     currentResult.append(done, createAudio(job, false));
   } else if (job.status === "failed") {
     const error = document.createElement("div");
@@ -158,6 +222,8 @@ function renderCurrent(job) {
     error.textContent = job.error || "Không tạo được audio. Hãy xem chi tiết lượt chạy.";
     currentResult.appendChild(error);
   }
+  const segmentList = createSegmentList(job);
+  if (segmentList) currentResult.appendChild(segmentList);
 }
 
 function renderHistory() {
@@ -169,6 +235,7 @@ function renderHistory() {
     historyList.appendChild(empty);
     return;
   }
+
   jobs.forEach((job) => {
     const item = document.createElement("article");
     item.className = "history-item";
@@ -201,7 +268,9 @@ function renderHistory() {
       const timerRow = document.createElement("div");
       timerRow.className = "timer-row";
       const label = document.createElement("span");
-      label.textContent = job.status === "queued" ? "Đang đợi đến lượt" : "Đang khởi tạo";
+      label.textContent = job.segment_count
+        ? (job.completed_segments || 0) + "/" + job.segment_count + " đoạn hoàn tất"
+        : "Đang chờ chia đoạn";
       const timer = document.createElement("span");
       timer.className = "timer";
       timer.dataset.jobId = String(job.id);
@@ -216,6 +285,9 @@ function renderHistory() {
       error.textContent = job.error || "Tạo audio thất bại.";
       item.appendChild(error);
     }
+
+    const segmentList = createSegmentList(job);
+    if (segmentList) item.appendChild(segmentList);
     historyList.appendChild(item);
   });
 }
@@ -291,7 +363,7 @@ form.addEventListener("submit", async (event) => {
     }
     if (!response.ok) throw new Error(data.error || "Không tạo được yêu cầu.");
     newestLocalJobId = data.job.id;
-    formMessage.textContent = "Đã xếp hàng " + data.job.label + ". Số AU được giữ nguyên dù tác vụ thành công hay thất bại.";
+    formMessage.textContent = "Đã xếp hàng " + data.job.label + ". Hệ thống sẽ chia nội dung thành các đoạn 5.000 ký tự.";
     formMessage.className = "form-message";
     await refreshJobs();
   } catch (error) {
